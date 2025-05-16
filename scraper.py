@@ -3,15 +3,17 @@ import os
 import re
 import time
 import zipfile
+import json
+import logging
+import argparse
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Dict, Optional, Set, Tuple, Type, Union
+from urllib.parse import urljoin, unquote, urlparse, parse_qs, urlencode
+
 import requests
 from bs4 import BeautifulSoup
 from tqdm import tqdm
-from urllib.parse import urljoin, unquote
-import concurrent.futures
-from pathlib import Path
-import json
-import logging
-from typing import List, Dict, Optional
 
 # Set up logging
 logging.basicConfig(
@@ -24,9 +26,61 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class PokemonCardScraper:
-    def __init__(self, base_url: str = "https://www.pokellector.com"):
+class BaseScraper:
+    """Base class for all scrapers with common functionality."""
+    
+    def __init__(self, base_url: str):
         self.base_url = base_url
+        self.session = self._create_session()
+        self.downloaded_files = set()
+        self.progress_file = 'progress.json'
+        self._load_progress()
+        
+    def _create_session(self):
+        """Create and configure a requests session."""
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*',
+            'Accept-Language': 'en-US,en;q=0.5',
+        })
+        return session
+        
+    def _load_progress(self):
+        """Load progress from file."""
+        if os.path.exists(self.progress_file):
+            try:
+                with open(self.progress_file, 'r') as f:
+                    self.downloaded_files = set(json.load(f))
+            except Exception as e:
+                logger.error(f"Error loading progress: {e}")
+    
+    def _save_progress(self):
+        """Save progress to file."""
+        try:
+            with open(self.progress_file, 'w') as f:
+                json.dump(list(self.downloaded_files), f)
+        except Exception as e:
+            logger.error(f"Error saving progress: {e}")
+            
+    def get_soup(self, url: str, **kwargs) -> Optional[BeautifulSoup]:
+        """Get BeautifulSoup object from URL with retry logic."""
+        try:
+            response = self.session.get(url, timeout=30, **kwargs)
+            response.raise_for_status()
+            return BeautifulSoup(response.text, 'html.parser')
+        except Exception as e:
+            logger.error(f"Error fetching {url}: {e}")
+            return None
+
+
+class PokemonCardScraper(BaseScraper):
+    """Scraper for Pokellector website."""
+    
+    def __init__(self, language: str = 'en'):
+        self.language = language
+        base_url = "https://jp.pokellector.com" if language == 'jp' else "https://www.pokellector.com"
+        super().__init__(base_url)
         
         # Configure session with connection pooling and timeouts
         session = requests.Session()
@@ -655,8 +709,13 @@ class PokemonCardScraper:
     def download_image(self, card: Dict[str, str]) -> bool:
         """Download a single card image."""
         try:
-            # Create set directory if it doesn't exist
-            set_dir = os.path.join(self.output_dir, card['set_code'])
+            # Create directory structure: output_dir/source/language/set_code/
+            set_dir = os.path.join(
+                self.output_dir,
+                'pokellector',  # Source
+                self.language,   # Language
+                card['set_code']
+            )
             os.makedirs(set_dir, exist_ok=True)
             
             # Create filename: [set-code]-[number].png
@@ -689,6 +748,7 @@ class PokemonCardScraper:
                     if os.path.getsize(filepath) > 0:
                         self.downloaded_files.add(download_id)
                         self.save_progress()
+                        logger.info(f"Downloaded: {os.path.join('pokellector', self.language, card['set_code'], filename)}")
                         return True
                     else:
                         os.remove(filepath)  # Remove empty file
@@ -737,79 +797,468 @@ class PokemonCardScraper:
 
 def main():
     try:
+        # Configure logging
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('scraper.log'),
+                logging.StreamHandler()
+            ]
+        )
+        
         logger.info("Starting Pokémon Card Scraper")
         
-        # Initialize scraper
-        scraper = PokemonCardScraper()
+        # Get user selection
+        user_selection = prompt_user_selection()
+        if not user_selection:
+            return
+            
+        # Configure logging level
+        logging.getLogger().setLevel(getattr(logging, user_selection['log_level']))
+        
+        # Initialize the appropriate scraper
+        scraper = get_scraper(user_selection['source'], user_selection['language'])
+        
+        # Set output directory
+        scraper.output_dir = user_selection['output_dir']
+        os.makedirs(scraper.output_dir, exist_ok=True)
         
         # Get all sets
+        logger.info("Fetching available sets...")
         sets = scraper.get_sets()
         
         if not sets:
-            logger.error("No sets found. The website structure might have changed.")
+            logger.error("No sets found. The website structure might have changed or the selected language might not be available.")
             return
         
-        logger.info(f"Found {len(sets)} sets to process")
+        # Let user select sets to download
+        print(f"\nFound {len(sets)} sets:")
+        for i, set_info in enumerate(sets, 1):
+            print(f"{i}. {set_info['name']} ({set_info['code']})")
         
-        # Process each set
+        while True:
+            selection = input("\nEnter the numbers of the sets you want to download (comma-separated, or 'all'): ").strip().lower()
+            
+            if selection == 'all':
+                selected_indices = list(range(len(sets)))
+                break
+                
+            try:
+                selected_indices = [int(idx.strip()) - 1 for idx in selection.split(',')]
+                if all(0 <= idx < len(sets) for idx in selected_indices):
+                    break
+                print("Invalid selection. Please enter valid numbers or 'all'.")
+            except ValueError:
+                print("Invalid input. Please enter numbers separated by commas or 'all'.")
+        
+        # Download selected sets
+        selected_sets = [sets[i] for i in selected_indices]
+        logger.info(f"Starting download of {len(selected_sets)} sets...")
+        
         total_cards = 0
         successful_downloads = 0
         
-        for set_info in sets:
+        for set_info in selected_sets:
             try:
+                print(f"\n{'='*50}")
+                print(f"Processing set: {set_info['name']} ({set_info['code']})")
+                print(f"URL: {set_info['url']}")
+                
                 # Get cards for this set
                 cards = scraper.get_cards_from_set(set_info)
                 if not cards:
-                    logger.warning(f"No cards found for set: {set_info['name']}")
+                    logger.warning(f"No cards found in set: {set_info['name']}")
                     continue
                 
                 total_cards += len(cards)
-                logger.info(f"Downloading {len(cards)} cards from {set_info['name']}")
+                logger.info(f"Found {len(cards)} cards. Starting download...")
                 
                 # Download cards with progress bar
-                with tqdm(total=len(cards), desc=f"{set_info['code']}", unit="card") as pbar:
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-                        futures = []
-                        for card in cards:
-                            futures.append(executor.submit(scraper.download_image, card))
-                        
-                        for future in concurrent.futures.as_completed(futures):
-                            if future.result():
+                success_count = 0
+                with tqdm(cards, desc=f"Downloading {set_info['code']}", unit="card") as pbar:
+                    for card in pbar:
+                        try:
+                            if scraper.download_image(card):
+                                success_count += 1
                                 successful_downloads += 1
-                            pbar.update(1)
+                                pbar.set_postfix(success=f"{success_count}/{len(cards)}")
+                            else:
+                                logger.warning(f"Failed to download: {card.get('name', 'Unknown card')}")
+                        except Exception as e:
+                            logger.error(f"Error downloading card: {e}", exc_info=True)
                 
-                # Small delay between sets to be nice to the server
-                time.sleep(1)
+                logger.info(f"✅ Successfully downloaded {success_count}/{len(cards)} cards from {set_info['name']}")
+                time.sleep(1)  # Be nice to the server
                 
             except Exception as e:
-                logger.error(f"Error processing set {set_info['name']}: {e}")
+                logger.error(f"Error processing set {set_info['name']}: {e}", exc_info=True)
                 continue
         
-        logger.info(f"\nDownloaded {successful_downloads} out of {total_cards} cards")
-        
         # Create zip archive
-        zip_path = scraper.create_zip_archive()
-        
-        if zip_path:
-            logger.info(f"\nAll done! Cards have been downloaded to: {scraper.output_dir}")
-            logger.info(f"Zip archive created at: {zip_path}")
+        if successful_downloads > 0:
+            zip_path = scraper.create_zip_archive()
+            if zip_path:
+                logger.info(f"\n🎉 Scraping completed successfully!")
+                logger.info(f"Total cards processed: {successful_downloads}")
+                logger.info(f"Cards downloaded to: {scraper.output_dir}")
+                logger.info(f"Zip archive created at: {zip_path}")
         else:
-            logger.error("Failed to create zip archive")
+            logger.warning("⚠️ No cards were downloaded. Please check the logs for errors.")
     
     except KeyboardInterrupt:
-        logger.info("\nOperation cancelled by user")
+        logger.info("\n⚠️ Operation cancelled by user.")
     except Exception as e:
         logger.error(f"An unexpected error occurred: {e}", exc_info=True)
     finally:
-        # Ensure we save progress even if the program crashes
-        if 'scraper' in locals():
+        # Save progress if scraper was initialized
+        if 'scraper' in locals() and hasattr(scraper, 'save_progress'):
             scraper.save_progress()
-        logger.info("Scraping completed")
+
+class TCGCollectorScraper(BaseScraper):
+    """Scraper for TCG Collector website."""
+    
+    def __init__(self, language: str = 'en'):
+        self.language = language
+        base_url = "https://www.tcgcollector.com"
+        super().__init__(base_url)
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*',
+            'Accept-Language': 'en-US,en;q=0.5',
+        })
+    
+    def get_sets(self) -> List[Dict[str, str]]:
+        """Get all Pokémon card sets from TCG Collector."""
+        url = f"{self.base_url}/sets/intl" if self.language != 'en' else f"{self.base_url}/sets"
+        logger.info(f"Fetching sets from: {url}")
+        
+        # Add headers to mimic a real browser
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Referer': 'https://www.tcgcollector.com/',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        }
+        
+        soup = self.get_soup(url, headers=headers)
+        if not soup:
+            logger.error("Failed to fetch sets page")
+            return []
+            
+        logger.debug(f"Page title: {soup.title.string if soup.title else 'No title'}")
+        
+        # Debug: Save the HTML for inspection
+        with open('tcgcollector_sets.html', 'w', encoding='utf-8') as f:
+            f.write(str(soup))
+            
+        sets = []
+        # Look for set links in the grid
+        set_links = soup.select('a.set-logo-grid-item-set-name')
+        logger.info(f"Found {len(set_links)} set links")
+        
+        for link in set_links:
+            try:
+                set_name = link.get('title', '').strip()
+                if not set_name:
+                    set_name = link.get_text(strip=True)
+                    
+                set_url = urljoin(self.base_url, link['href'])
+                set_code = self._extract_set_code(set_url)
+                
+                if not all([set_name, set_url, set_code]):
+                    logger.warning(f"Skipping incomplete set: name='{set_name}', url='{set_url}', code='{set_code}'")
+                    continue
+                    
+                logger.debug(f"Found set: {set_name} ({set_code}) at {set_url}")
+                
+                sets.append({
+                    'name': set_name,
+                    'url': set_url,
+                    'code': set_code,
+                    'language': self.language,
+                    'source': 'tcgcollector'
+                })
+                
+            except Exception as e:
+                logger.error(f"Error parsing set: {e}", exc_info=True)
+                continue
+                
+        logger.info(f"Successfully parsed {len(sets)} sets")
+        return sets
+    
+    def _extract_set_code(self, url: str) -> str:
+        """Extract set code from URL."""
+        # Example: /sets/11645/journey-together -> journey-together
+        parts = url.rstrip('/').split('/')
+        if len(parts) >= 2:
+            return parts[-1]
+        return ""
+    
+    def get_cards_from_set(self, set_info: Dict[str, str]) -> List[Dict[str, str]]:
+        """Get all cards from a specific set."""
+        logger.info(f"Fetching cards for set: {set_info['name']} ({set_info['code']})")
+        logger.debug(f"Set URL: {set_info['url']}")
+        
+        cards = []
+        page = 1
+        max_pages = 50  # Safety limit to prevent infinite loops
+        
+        while page <= max_pages:
+            logger.debug(f"Fetching page {page} of cards...")
+            
+            # Add parameters for pagination and display
+            params = {
+                'releaseDateOrder': 'newToOld',
+                'displayAs': 'images',
+                'page': page,
+                'pageSize': 100  # Try to get more cards per page if possible
+            }
+            
+            url = f"{set_info['url']}?{urlencode(params)}"
+            logger.debug(f"Fetching URL: {url}")
+            
+            # Add headers to mimic a real browser
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Referer': set_info['url'],
+                'Accept-Language': 'en-US,en;q=0.5',
+            }
+            
+            soup = self.get_soup(url, headers=headers)
+            if not soup:
+                logger.error(f"Failed to fetch page {page}")
+                break
+                
+            # Debug: Save the HTML for inspection
+            with open(f'tcgcollector_page_{page}.html', 'w', encoding='utf-8') as f:
+                f.write(str(soup))
+            
+            # Find all card containers - update selector based on actual page structure
+            card_containers = soup.select('.card-image-grid-item, .card-item')
+            logger.debug(f"Found {len(card_containers)} card containers on page {page}")
+            
+            if not card_containers:
+                logger.warning("No card containers found, page might be empty or using different structure")
+                break
+                
+            for container in card_containers:
+                try:
+                    # Try to find the image element
+                    img = container.select_one('img')
+                    if not img or not img.get('src') and not img.get('data-src'):
+                        logger.debug("Skipping container with no valid image")
+                        continue
+                        
+                    # Get image URL (prefer data-src for lazy-loaded images)
+                    img_url = img.get('data-src') or img.get('src')
+                    if not img_url:
+                        logger.debug("No image URL found")
+                        continue
+                        
+                    # Clean up the image URL
+                    img_url = img_url.split('?')[0]  # Remove query parameters
+                    img_url = urljoin(self.base_url, img_url)
+                    
+                    # Get card name from alt text or other elements
+                    card_name = img.get('alt', '').strip()
+                    if not card_name:
+                        name_elem = container.select_one('.card-name, .name')
+                        if name_elem:
+                            card_name = name_elem.get_text(strip=True)
+                    
+                    # Extract card number
+                    card_number = ''
+                    number_elem = container.select_one('.card-number, .number')
+                    if number_elem:
+                        card_number = number_elem.get_text(strip=True).strip('#')
+                    
+                    # Get card URL
+                    card_url = ''
+                    link = container.find_parent('a')
+                    if link and link.get('href'):
+                        card_url = urljoin(self.base_url, link['href'])
+                    
+                    if not card_name:
+                        logger.warning(f"Skipping card with no name at {img_url}")
+                        continue
+                        
+                    # Create card data
+                    card_data = {
+                        'name': card_name,
+                        'number': card_number or '0',
+                        'set_code': set_info['code'],
+                        'image_url': img_url,
+                        'card_url': card_url or set_info['url'],
+                        'language': self.language,
+                        'source': 'tcgcollector'
+                    }
+                    
+                    logger.debug(f"Found card: {card_name} ({card_number})")
+                    cards.append(card_data)
+                    
+                except Exception as e:
+                    logger.error(f"Error parsing card: {e}", exc_info=True)
+                    continue
+            
+            # Check if there's a next page
+            next_page = soup.select_one('a.page-link[rel="next"], a.next-page, a[rel="next"]')
+            if not next_page:
+                logger.debug("No more pages found")
+                break
+                
+            page += 1
+            time.sleep(1)  # Be nice to the server
+            
+        logger.info(f"Found {len(cards)} cards in set {set_info['name']}")
+        return cards
+    
+    def download_image(self, card: Dict[str, str]) -> bool:
+        """Download a single card image."""
+        try:
+            if not card.get('image_url'):
+                logger.warning(f"No image URL provided for card: {card.get('name', 'Unknown')}")
+                return False
+                
+            # Create directory structure: output_dir/source/language/set_code/
+            set_dir = os.path.join(
+                self.output_dir,
+                'tcgcollector',  # Source
+                self.language,    # Language
+                card['set_code']  # Set code
+            )
+            os.makedirs(set_dir, exist_ok=True)
+            
+            # Generate a safe filename
+            safe_name = re.sub(r'[^\w\s-]', '', card['name']).strip()
+            safe_name = re.sub(r'\s+', '-', safe_name)  # Replace spaces with hyphens
+            
+            # Format the card number with leading zeros
+            try:
+                card_number = str(int(card['number']))
+                card_number = card_number.zfill(3)  # Pad with leading zeros
+            except (ValueError, TypeError):
+                card_number = card.get('number', '000')
+            
+            # Create filename: set_code-number-name.jpg
+            filename = f"{card['set_code']}-{card_number}-{safe_name}.jpg"
+            filepath = os.path.join(set_dir, filename)
+            
+            # Skip if already downloaded and has content
+            if os.path.exists(filepath):
+                file_size = os.path.getsize(filepath)
+                if file_size > 1024:  # File exists and has reasonable size
+                    logger.debug(f"Skipping existing: {filename} ({file_size} bytes)")
+                    return True
+                logger.warning(f"Found existing file with size {file_size} bytes, re-downloading: {filename}")
+                
+            # Download the image
+            response = self.session.get(card['image_url'], stream=True, timeout=30)
+            response.raise_for_status()
+            
+            # Save the image
+            with open(filepath, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+                    
+            logger.info(f"Downloaded: {os.path.join('pokellector', self.language, card['set_code'], filename)}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error downloading {card.get('name', 'unknown')}: {e}")
+            return False
+
+# ... (rest of the code remains the same)
+
+def get_scraper(source: str, language: str = 'en') -> Union[PokemonCardScraper, TCGCollectorScraper]:
+    """Get the appropriate scraper instance based on source and language."""
+    if source == 'tcgcollector':
+        return TCGCollectorScraper(language=language)
+    return PokemonCardScraper(language=language)
+
+
+def prompt_user_selection() -> dict:
+    """Prompt user to select source and language interactively."""
+    print("\n=== Pokémon Card Scraper ===\n")
+    
+    # Source selection
+    while True:
+        print("Select a source:")
+        print("1. Pokellector (English/Japanese)")
+        print("2. TCG Collector (English/Japanese)")
+        print("3. Exit")
+        
+        choice = input("\nEnter your choice (1-3): ").strip()
+        
+        if choice == '1':
+            source = 'pokellector'
+            break
+        elif choice == '2':
+            source = 'tcgcollector'
+            break
+        elif choice.lower() in ('3', 'exit', 'quit'):
+            print("Goodbye!")
+            return None
+        else:
+            print("Invalid choice. Please enter 1, 2, or 3.")
+    
+    # Language selection
+    while True:
+        print("\nSelect language:")
+        print("1. English (en)")
+        print("2. Japanese (jp)")
+        
+        lang_choice = input("\nEnter your choice (1-2): ").strip()
+        
+        if lang_choice == '1':
+            language = 'en'
+            break
+        elif lang_choice == '2':
+            language = 'jp'
+            break
+        else:
+            print("Invalid choice. Please enter 1 or 2.")
+    
+    # Output directory
+    output_dir = input("\nEnter output directory (default: 'pokemon_cards'): ").strip() or 'pokemon_cards'
+    
+    # Log level
+    while True:
+        print("\nSelect log level:")
+        print("1. DEBUG (Most detailed)")
+        print("2. INFO (Recommended)")
+        print("3. WARNING (Only warnings and errors)")
+        print("4. ERROR (Only errors)")
+        
+        log_choice = input("\nEnter your choice (1-4): ").strip()
+        log_levels = {
+            '1': 'DEBUG',
+            '2': 'INFO',
+            '3': 'WARNING',
+            '4': 'ERROR'
+        }
+        
+        if log_choice in log_levels:
+            log_level = log_levels[log_choice]
+            break
+        else:
+            print("Invalid choice. Please enter a number between 1 and 4.")
+    
+    return {
+        'source': source,
+        'language': language,
+        'output_dir': output_dir,
+        'log_level': log_level
+    }
+
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        logger.critical(f"Fatal error: {e}", exc_info=True)
-        print(f"A critical error occurred. Please check the log file for details.")
+        logging.error(f"An error occurred: {e}", exc_info=True)
         raise
