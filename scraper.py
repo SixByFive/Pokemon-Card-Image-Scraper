@@ -795,6 +795,22 @@ class PokemonCardScraper(BaseScraper):
             logger.error(f"Error creating zip archive: {e}")
             return ""
 
+class UnicodeStreamHandler(logging.StreamHandler):
+    """Stream handler that properly handles Unicode characters on Windows."""
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            # Replace emojis with text equivalents for Windows console
+            msg = (msg.replace('✅', '[OK]')
+                     .replace('⚠️', '[!]')
+                     .replace('❌', '[X]')
+                     .replace('🎉', '[!]'))
+            stream = self.stream
+            stream.write(msg + self.terminator)
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
 def main():
     try:
         # Configure logging
@@ -802,8 +818,8 @@ def main():
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
             handlers=[
-                logging.FileHandler('scraper.log'),
-                logging.StreamHandler()
+                logging.FileHandler('scraper.log', encoding='utf-8'),
+                UnicodeStreamHandler()
             ]
         )
         
@@ -888,7 +904,7 @@ def main():
                         except Exception as e:
                             logger.error(f"Error downloading card: {e}", exc_info=True)
                 
-                logger.info(f"✅ Successfully downloaded {success_count}/{len(cards)} cards from {set_info['name']}")
+                logger.info(f"[OK] Successfully downloaded {success_count}/{len(cards)} cards from {set_info['name']}")
                 time.sleep(1)  # Be nice to the server
                 
             except Exception as e:
@@ -899,15 +915,15 @@ def main():
         if successful_downloads > 0:
             zip_path = scraper.create_zip_archive()
             if zip_path:
-                logger.info(f"\n🎉 Scraping completed successfully!")
+                logger.info(f"\n[!] Scraping completed successfully!")
                 logger.info(f"Total cards processed: {successful_downloads}")
                 logger.info(f"Cards downloaded to: {scraper.output_dir}")
                 logger.info(f"Zip archive created at: {zip_path}")
         else:
-            logger.warning("⚠️ No cards were downloaded. Please check the logs for errors.")
+            logger.warning("[!] No cards were downloaded. Please check the logs for errors.")
     
     except KeyboardInterrupt:
-        logger.info("\n⚠️ Operation cancelled by user.")
+        logger.info("\n[!] Operation cancelled by user.")
     except Exception as e:
         logger.error(f"An unexpected error occurred: {e}", exc_info=True)
     finally:
@@ -1165,12 +1181,47 @@ class TCGCollectorScraper(BaseScraper):
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
                     
-            logger.info(f"Downloaded: {os.path.join('pokellector', self.language, card['set_code'], filename)}")
+            logger.info(f"Downloaded: {os.path.join('tcgcollector', self.language, card['set_code'], filename)}")
             return True
             
         except Exception as e:
             logger.error(f"Error downloading {card.get('name', 'unknown')}: {e}")
             return False
+            
+    def create_zip_archive(self) -> str:
+        """Create a zip archive of all downloaded images."""
+        try:
+            # Create a zip file with timestamp
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            zip_filename = f"pokemon_cards_tcgcollector_{self.language}_{timestamp}.zip"
+            zip_path = os.path.join(self.output_dir, zip_filename)
+            
+            # Get all image files
+            image_extensions = ('.jpg', '.jpeg', '.png', '.webp')
+            image_files = []
+            
+            for root, _, files in os.walk(self.output_dir):
+                for file in files:
+                    if file.lower().endswith(image_extensions):
+                        image_files.append(os.path.join(root, file))
+            
+            if not image_files:
+                logger.warning("No image files found to include in the zip archive.")
+                return ""
+                
+            # Create zip file
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for image_file in image_files:
+                    # Calculate the relative path for the zip file
+                    rel_path = os.path.relpath(image_file, self.output_dir)
+                    zipf.write(image_file, rel_path)
+            
+            logger.info(f"Created zip archive: {zip_path} ({os.path.getsize(zip_path) / (1024*1024):.2f} MB)")
+            return zip_path
+            
+        except Exception as e:
+            logger.error(f"Error creating zip archive: {e}")
+            return ""
 
 # ... (rest of the code remains the same)
 
